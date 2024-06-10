@@ -1,0 +1,741 @@
+import sys
+import cv2
+import numpy as np
+
+from PIL import Image
+import os
+from ultralytics import YOLO
+import torch
+import math
+import time
+from tqdm import *
+import pandas as pd
+import openpyxl
+
+
+# pip install openpyxl
+
+# 有 GPU 就用 GPU，没有就用 CPU
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+bsavePre =False
+
+class Knee:
+    def __init__(self,sourcePath):
+        self.read_images_in_folder(sourcePath)
+        self.loadModel()
+        self.angle_offset=5
+        self.horizontal_threshold=0.2
+        self.vertical_threshold=0.2
+        self.Medial_lateral_condyles_threshold=7
+        # Visualization关键点可视化画图
+        self.Visualization=False 
+
+    def loadModel(self): 
+        self.knee_ap_lat_classify_session = YOLO(r'C:\SynologyDrive\code\knee\models\knee_ap_lat_classify\yolov8m-cls3\weights\best.pt',task="classify")
+        self.knee_ap_detection_session = YOLO(r"C:\Users\ruxuanyan\Desktop\膝关节图像整理\膝关节正位检测\knee_ap_detect\weights\best.pt")
+        self.knee_lat_detection_session = YOLO(r'C:\SynologyDrive\code\knee\models\knee_lat_detection_paddle\yolov8m2\weights\best.pt')
+        self.knee_lat_pose_session = YOLO(r'C:\SynologyDrive\code\knee\models\knee_lat_pose\best.pt')
+        self.knee_lat_Medial_lateral_condyles_Seg_session= YOLO(r'C:\SynologyDrive\code\knee\models\neiwaiceke\best20240106.pt')
+        self.knee_lat_patella_classify_session= YOLO(r'C:\SynologyDrive\code\knee\models\knee_lat_bingu_classify\20240109-yolov8m-cls3\weights\best20210112.pt')
+        self.knee_ap_patella_classify_session= YOLO(r"C:\SynologyDrive\code\knee\models\knee_ap_bingu_classify\yolov8m-cls\weights\best20240112.pt")
+        self.knee_ap_HeadofFibular_classify_session= YOLO(r'C:\SynologyDrive\code\knee\models\knee_ap_feigutou_classify\yolov8m-cls\weights\best.pt')
+        
+        
+
+        print("初始化ok")
+    # 预测主函数
+    def predict(self):
+        for i in tqdm(range(len(self.image_list))):
+            ele = self.image_list[i]
+            self.knee_ap_lat_classify(ele)
+            if ele['bodyPosition']==0:
+                # 正位图像处理
+                self.knee_ap_detection(ele)
+                if self.Visualization==True:
+                    self.drawPreImage(ele)
+            elif ele['bodyPosition']==1:
+                # 侧位图像处理
+                self.knee_lat_detection(ele)
+                # 侧位角度测量
+                self.knee_lat_pose(ele)
+                if self.Visualization==True:
+                    self.drawPreImage(ele)
+            else:
+                print("err")
+        print("all ok")
+
+    # 膝关节正侧位分类函数 
+    # https://docs.ultralytics.com/modes/predict/#inference-arguments   
+    def knee_ap_lat_classify(self,item):
+        # Run batched inference on a list of images
+        filePath = item["filePath"] 
+        results = self.knee_ap_lat_classify_session(filePath, save=bsavePre,conf=0.5)  # return a list of Results objects
+
+        # Process results list
+        for result in results:
+            probs = result.probs  # Probs object for classification outputs
+            item['bodyPosition']= probs.top1
+            # print(probs)
+
+
+    def knee_ap_detection(self,item):
+        # Run batched inference on a list of images
+        # 有问题的都是1
+        filePath = item["filePath"] 
+        if item.get("cvImage") == None:
+            item["cvImage"] = cv2.imread(filePath)
+        results = self.knee_ap_detection_session(filePath, save=bsavePre, conf=0.5)  # return a list of Results objects
+
+        # 异物默认有
+        item["result"]["foreignMatter"] =1
+        # 标识默认没有标
+        item["result"]["mark"] =1
+             
+        # 0: 'feigutou_ap' 1:'biaoshi' 2:'bingu' 3:'guanjiejianxi' 4: 'yiwu'
+        for result in results:
+            boxes = result.boxes.data.tolist()
+                # 遍历每个框
+            for box in boxes:
+                # ap_HeadofFibular
+                if int(box[5]) == 0:
+                    image = cv2.imread(filePath)
+                    # 确保提供的参数是浮点数
+                    x1, y1, x2, y2,_,__ = box
+                    # 转换为整数
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    # 裁剪图像
+                    cropped_image = image[y1:y2, x1:x2]
+                    if self.knee_ap_HeadofFibular_classify(cropped_image)==1:
+                        # 0 bad 1 good
+                        # 现在要找qC问题，所以相反
+                        item["result"]["ap_HeadofFibular"] =0
+                        
+                    else:
+                        item["result"]["ap_HeadofFibular"] =1
+                        self.drawBox(item["cvImage"],[[x1, y1, x2, y2]],"ap_HeadofFibular")
+                    
+                # mark 标识
+                if int(box[5]) == 1:
+                    item["result"]["mark"] =0
+                # knee_ap_patella    
+                if int(box[5]) == 2:
+                    image = cv2.imread(filePath)
+                    # 确保提供的参数是浮点数
+                    x1, y1, x2, y2,_,__ = box
+                    # 转换为整数
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    # 裁剪图像
+                    cropped_image = image[y1:y2, x1:x2]
+                    
+                    if self.knee_ap_patella_classify(cropped_image)==1:
+                        # {0: 'bad', 1: 'good'}
+                        # 现在要找qC问题，所以相反
+                        item["result"]["ap_patella"] =0
+                    else:
+                        item["result"]["ap_patella"] =1
+                        self.drawBox(item["cvImage"],[[x1, y1, x2, y2]],"knee_ap_patella")
+
+                # joint space 关节间隙
+                # 上下左右都在范围内时0 ，超出范围QC不合格1
+                if int(box[5]) == 3:
+                    # print(box)
+                    x1, y1, x2, y2,_,__ = box
+                    # 转换为整数
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    if self.knee_ap_center_of_field_classify(item["size"],box):
+                        item["result"]["ap_center"] =0
+                    else:
+                        item["result"]["ap_center"] =1
+                        self.drawBox(item["cvImage"],[[x1, y1, x2, y2]],"joint space")
+                # foreign matter 异物
+                if int(box[5]) == 4:
+                    x1, y1, x2, y2,_,__ = box
+                    # 转换为整数
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    self.drawBox(item["cvImage"],[[x1, y1, x2, y2]],"joint space")
+                    item["result"]["foreignMatter"] =1        
+
+    def knee_lat_detection(self,item):
+
+        filePath = item["filePath"] 
+        # 异物、标识默认 QC合格
+        item["result"]["foreignMatter"] =0
+        item["result"]["mark"] =1
+
+        if item.get("cvImage") == None:
+            item["cvImage"] = cv2.imread(filePath)
+  
+        # 0:'feigutou_Lat'1:'biaoshi'2:'bingu'3:'neiwaiceke'4:'yiwu'
+        results = self.knee_lat_detection_session(filePath, save=bsavePre, conf=0.5)
+        for result in results:
+            boxes = result.boxes.data.tolist()
+                # 遍历每个框
+            for box in boxes:
+                # HeadofFibular 腓骨头
+                if int(box[5]) == 0:
+                    pass
+                    # print('HeadofFibular')
+                # mark 标识
+                if int(box[5]) == 1:
+                    item["result"]["mark"] =0
+                # patella 髌骨
+                if int(box[5]) == 2:
+                    image = cv2.imread(filePath)
+                    # 确保提供的参数是浮点数
+                    x1, y1, x2, y2,_,__ = box
+                    # 转换为整数
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    # 裁剪图像
+                    cropped_image = image[y1:y2, x1:x2]
+                    
+                    if self.knee_lat_patella_classify(cropped_image)==0:
+                        # {0: 'bad', 1: 'good'}
+                        item["result"]["lat_patella"] =1
+                        self.drawBox(item["cvImage"],[[x1, y1, x2, y2]],"knee_lat_patella_classify")
+                    else:
+                        item["result"]["lat_patella"] =0
+                        
+                # 内外侧髁
+                if int(box[5]) == 3:
+                    # print(box)
+                    image = cv2.imread(filePath)
+                    # 确保提供的参数是浮点数
+                    x1, y1, x2, y2,_,__ = box
+                    # 转换为整数
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    # 裁剪图像
+
+                    # 放大裁剪
+                    # 假设原始坐标为 (x1, y1, x2, y2)
+                    x1_original, y1_original, x2_original, y2_original = x1, y1, x2, y2
+                    # 放大百分比
+                    enlarge_percentage = 20
+                    # 计算放大后的坐标
+                    width = x2_original - x1_original
+                    height = y2_original - y1_original
+
+                    x1 = int(x1_original - width * enlarge_percentage / 100)
+                    y1 = int(y1_original - height * enlarge_percentage / 100)
+                    x2 = int(x2_original + width * enlarge_percentage / 100)
+                    y2 = int(y2_original + height * enlarge_percentage / 100)                   
+
+                    cropped_image = image[y1:y2, x1:x2]
+                    # 保存预测的内外侧髁图像
+                    cropped_image_Path = os.path.join(r"C:\Users\ruxuanyan\Desktop\lat_neiwaiceke",os.path.splitext((os.path.basename(filePath)))[0]+".png")
+                    print(cropped_image_Path)
+                    cv2.imwrite(cropped_image_Path,cropped_image)
+                    
+                    # 小于阈值，Medial_lateral_condylesClassify函数返回1 QC合格
+                    if self.Medial_lateral_condylesClassify(cropped_image)==1:
+                        item["result"]["Medial_lateral_condy"] =0
+                    else:
+                        item["result"]["Medial_lateral_condy"] =1
+                        self.drawBox(item["cvImage"],[[x1, y1, x2, y2]],"Medial_lateral_condyles")
+                # foreign matter 异物  有异物QC不合格
+                if int(box[5]) == 4:
+                    item["result"]["foreignMatter"] =1
+                    # 确保提供的参数是浮点数
+                    x1, y1, x2, y2,_,__ = box
+                    # 转换为整数
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    # 裁剪图像
+                    self.drawBox(item["cvImage"],[[x1, y1, x2, y2]],"foreignMatter")
+    # 正位髌骨判断
+    def knee_ap_patella_classify(self,cv_img):
+        results = self.knee_ap_patella_classify_session(cv_img, save=bsavePre,conf=0.8)  # return a list of Results objects
+
+        # Process results list
+        for result in results:
+            # boxes = result.boxes  # Boxes object for bbox outputs
+            # masks = result.masks  # Masks object for segmentation masks outputs
+            # keypoints = result.keypoints  # Keypoints object for pose outputs
+            probs = result.probs  # Probs object for classification outputs
+            return probs.top1
+            # print(probs)
+
+        # 侧位髌骨判断
+    # 侧位髌骨
+    def knee_lat_patella_classify(self,cv_img):
+        results = self.knee_lat_patella_classify_session(cv_img, save=bsavePre,conf=0.9)  # return a list of Results objects
+
+        # Process results list
+        for result in results:
+            probs = result.probs 
+            return probs.top1
+    # 正位腓骨头
+    def knee_ap_HeadofFibular_classify(self,cv_img):
+        results = self.knee_ap_patella_classify_session(cv_img, save=bsavePre,conf=0.8)  # return a list of Results objects
+
+        # Process results list
+        for result in results:
+            probs = result.probs  # Probs object for classification outputs
+            return probs.top1
+
+        # 侧位髌骨判断
+    
+    # 侧位关键点检测
+    def knee_lat_pose(self,item):
+        # Run batched inference on a list of images
+        filePath = item["filePath"]
+        if item.get("cvImage").all() == None:
+            item["cvImage"] = cv2.imread(filePath)
+        results = self.knee_lat_pose_session(filePath, save=bsavePre,conf=0.6)  # return a list of Results objects
+
+        # Process results list
+        for result in results:
+            keypoints = result.keypoints.data.tolist()
+            # print(keypoints)
+            if (len(keypoints) < 1) or (len(keypoints[0]) <3):
+                # 没有找全关键点直接不合格
+                item["result"]["Lat_angle"] =1
+            else:
+                angle = self.calculate_angle(keypoints[0])
+                if angle <= 130+self.angle_offset and angle >=115-+self.angle_offset:
+                    # 115到130 加偏移范围 正常，qc = 0
+                    item["result"]["Lat_angle"] =0
+                else: 
+                    item["result"]["Lat_angle"] =1
+                self.drarPoint_ex(item["cvImage"],keypoints)
+
+    # 正位腓骨头判断
+    def knee_ap_fibularHead_classify(self,item):
+        pass
+            
+    def knee_ap_center_of_field_classify(self,size,boxes):
+        horizontal_result, vertical_result = self.is_center_within_threshold(size,boxes, self.horizontal_threshold, self.vertical_threshold)
+        if horizontal_result and vertical_result:
+            return True
+        else:
+            return False
+
+    def read_images_in_folder(self,folder_path):
+        """
+        读取指定文件夹中的所有图像文件并返回一个图像对象列表。
+        
+        参数:
+        folder_path (str): 包含图像文件的文件夹的路径。
+        
+        返回:
+        list: 包含图像对象的列表。
+        """
+        # 用于存储图像对象的列表
+        self.image_list = []       
+        for filename in os.listdir(folder_path):
+            # 检查文件是否是图像文件（可以根据需要添加更多的文件格式）
+            if filename.endswith(('.jpg', '.jpeg', '.png', '.gif')):
+                # 构建完整的文件路径
+                file_path = os.path.join(folder_path, filename)
+                imageItem = {}            
+                # 使用Pillow库打开图像文件
+                try:
+                    img = Image.open(file_path)
+                    imageItem["filename"] = filename
+                    imageItem["filePath"] = file_path
+                    imageItem["size"] = img.size
+                    imageItem["result"] = {}
+                    self.image_list.append(imageItem)
+                except Exception as e:
+                    print(f"无法打开文件 {filename}: {str(e)}")
+
+        # 返回包含所有图像对象的列表
+        return self.image_list
+
+    def calculate_angle(self,keypoints):
+        if len(keypoints) != 3:
+            return None  # 需要确保输入包含三个关键点
+
+        # 提取关键点的坐标
+        x1, y1, _ = keypoints[0]  # 第1个关键点
+        x2, y2, _ = keypoints[1]  # 第2个关键点
+        x3, y3, _ = keypoints[2]  # 第3个关键点
+
+        # 计算第1.2个关键点连线和2.3关键点连线之间的角度
+        angle = math.atan2(y2 - y1, x2 - x1) - math.atan2(y3 - y2, x3 - x2)
+        angle_degrees = math.degrees(angle)
+
+        # 如果角度为负值，转换为正值
+        if(abs(angle_degrees)<90):
+            angle_degrees = 180-abs(angle_degrees)
+        return angle_degrees
+
+    def is_center_within_threshold(self,image_size, rect_coords, horizontal_threshold=0.1, vertical_threshold=0.1):
+        # 解包图像尺寸
+        image_width, image_height = image_size
+        
+        # 解包矩形框左上角和右下角坐标
+        x1, y1, x2, y2, _, __ = rect_coords
+        
+        # 计算图像中心坐标
+        center_x = image_width / 2
+        center_y = image_height / 2
+        # print(horizontal_threshold)
+        # print(image_width)
+        # 计算水平和垂直方向的阈值范围
+        horizontal_range = horizontal_threshold * (image_width / 2.0)
+        vertical_range = vertical_threshold * (image_height / 2.0)
+        
+        # 计算矩形框的中点坐标
+        rect_center_x = (x1 + x2) / 2.0
+        rect_center_y = (y1 + y2) / 2.0
+        
+        # 判断中点是否在水平或垂直方向的阈值范围内
+        is_within_horizontal_range = abs(rect_center_x - center_x) <= horizontal_range
+        is_within_vertical_range = abs(rect_center_y - center_y) <= vertical_range
+        
+        return is_within_horizontal_range, is_within_vertical_range
+    
+    def Medial_lateral_condylesClassify(self,cv_img):
+
+        
+        def calculate_color_ratios(image_path_or_cv2):
+            if isinstance(image_path_or_cv2, str):
+        # 输入是图像路径，尝试加载图像
+                image = cv2.imread(image_path_or_cv2)
+
+                # 检查图像是否为None
+                if image is None:
+                    raise ValueError("无效的图像路径")
+            elif isinstance(image_path_or_cv2, np.ndarray):
+                # 输入是cv2格式的图像对象
+                image = image_path_or_cv2
+            else:
+                raise ValueError("不支持的输入类型")
+
+            # 将图像从BGR颜色空间转换为RGB颜色空间
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # 将图像展平为一维数组
+            flattened_image = image.reshape(-1, 3)
+
+            # 明确将数据类型转换为int64，以避免数据类型不匹配的错误
+            flattened_image = flattened_image.astype(np.int64)
+
+            # 统计图像中每种颜色的像素数量
+            color_counts = np.bincount(np.dot(flattened_image, [65536, 256, 1]))
+
+            # 计算颜色比例
+            total_pixels = flattened_image.shape[0]
+            color_ratios = color_counts / total_pixels
+
+            # 获取所有非零颜色的色值和比例
+            non_zero_colors = np.nonzero(color_ratios)[0]
+            color_values = non_zero_colors.tolist()
+            color_ratios = color_ratios[non_zero_colors]
+
+            return color_values, color_ratios
+
+
+        H, W, _ = cv_img.shape
+        if(H==0 or W==0):
+            return 999
+        results = self.knee_lat_Medial_lateral_condyles_Seg_session.predict(cv_img, save=False, imgsz=320, conf=0.8,save_txt=False) 
+        for result in results:
+            if    result.masks  is not None:  
+                for j, mask in enumerate(result.masks.data):
+                    if(j==0):
+                        mask = mask.numpy() * 255
+                    else:
+                        mask = mask.numpy() * 255 + preArry
+                    preArry = mask
+            else:
+                return 1
+        mask = cv2.resize(mask, (W, H))
+        # cv2.imwrite('./neiwaiceke-mask.png', preArry)
+
+        # color = calculate_color_ratios('./neiwaiceke-mask.png')
+
+        color_values, color_ratios = calculate_color_ratios(mask)
+
+        # ([0, 16777215], array([    0.83474,     0.16526]))
+        # print(color_values, color_ratios)
+        fenlei = None
+        if (color_ratios[1]<self.Medial_lateral_condyles_threshold):
+            fenlei = 1
+        else:
+            fenlei = 0
+
+        # print("%s %.2f" % (fenlei,color_ratios[1])) 
+        return fenlei 
+    
+    def drarPoint(self,cvImage,keypoints):
+        image = cvImage
+        # 框（rectangle）可视化配置
+        bbox_color = (150, 0, 0)             # 框的 BGR 颜色
+        bbox_thickness = 6                   # 框的线宽
+
+        # 框类别文字
+        bbox_labelstr = {
+            'font_size':4,         # 字体大小
+            'font_thickness':10,   # 字体粗细
+            'offset_x':0,          # X 方向，文字偏移距离，向右为正
+            'offset_y':-80,        # Y 方向，文字偏移距离，向下为正
+        }
+
+        # 关键点 BGR 配色
+        kpt_color_map = {
+            0:{'name':'a', 'color':[255, 0, 0], 'radius':20},      # 30度角点
+            1:{'name':'b', 'color':[0, 255, 0], 'radius':20},      # 60度角点
+            2:{'name':'c', 'color':[0, 0, 255], 'radius':20},      # 90度角点
+        }
+
+        # 点类别文字
+        kpt_labelstr = {
+            'font_size':2,             # 字体大小
+            'font_thickness':5,       # 字体粗细
+            'offset_x':30,             # X 方向，文字偏移距离，向右为正
+            'offset_y':120,            # Y 方向，文字偏移距离，向下为正
+        }
+
+        # 骨架连接 BGR 配色
+        skeleton_map = [
+            {'srt_kpt_id':0, 'dst_kpt_id':1, 'color':[196, 75, 255], 'thickness':3},        # 30度角点-60度角点
+            {'srt_kpt_id':1, 'dst_kpt_id':2, 'color':[180, 187, 28], 'thickness':3},        # 30度角点-90度角点
+        ]
+        keypoints = keypoints[0]
+        # 画该框的骨架连接
+        for skeleton in skeleton_map:
+            
+            # 获取起始点坐标
+            srt_kpt_id = skeleton['srt_kpt_id']
+            srt_kpt_x = int(keypoints[srt_kpt_id][0])
+            srt_kpt_y = int(keypoints[srt_kpt_id][1])
+            
+            # 获取终止点坐标
+            dst_kpt_id = skeleton['dst_kpt_id']
+            dst_kpt_x = int(keypoints[dst_kpt_id][0])
+            dst_kpt_y = int(keypoints[dst_kpt_id][1])
+            
+            # 获取骨架连接颜色
+            skeleton_color = skeleton['color']
+            
+            # 获取骨架连接线宽
+            skeleton_thickness = skeleton['thickness']
+            
+            # 画骨架连接
+            image = cv2.line(image, (srt_kpt_x, srt_kpt_y),(dst_kpt_x, dst_kpt_y),color=skeleton_color,thickness=skeleton_thickness)
+            
+            # 画该框的关键点
+            for kpt_id in kpt_color_map:
+                
+                # 获取该关键点的颜色、半径、XY坐标
+                kpt_color = kpt_color_map[kpt_id]['color']
+                kpt_radius = kpt_color_map[kpt_id]['radius']
+                kpt_x = int(keypoints[kpt_id][0])
+                kpt_y = int(keypoints[kpt_id][1])
+                
+                # 画圆：图片、XY坐标、半径、颜色、线宽（-1为填充）
+                self.image = cv2.circle(image, (kpt_x, kpt_y), kpt_radius, kpt_color, -1)
+                
+                # 写关键点类别文字：图片，文字字符串，文字左上角坐标，字体，字体大小，颜色，字体粗细
+                # kpt_label = str(kpt_id) # 写关键点类别 ID
+                kpt_label = str(kpt_color_map[kpt_id]['name']) # 写关键点类别名称
+                if (kpt_label=="a"or kpt_label=="c"):
+                    kpt_label=" "
+                elif (kpt_label=="b"):
+                    def calculate_angle(a, b, c):
+                        # Convert the points to NumPy arrays for vector operations
+                        a, b, c = np.array(a, dtype=np.float64), np.array(b, dtype=np.float64), np.array(c, dtype=np.float64)
+                        # Calculate vectors AB and BC
+                        ab_vector = b - a
+                        bc_vector = c - b
+
+                        # Calculate the dot product of AB and BC
+                        dot_product = np.dot(ab_vector, bc_vector)
+
+                        # Calculate the magnitudes of AB and BC
+                        ab_magnitude = np.linalg.norm(ab_vector)
+                        bc_magnitude = np.linalg.norm(bc_vector)
+
+                        # Calculate the cosine of the angle between AB and BC
+                        cosine_theta = dot_product / (ab_magnitude * bc_magnitude)
+
+                        # Calculate the angle in radians
+                        angle_radians = math.acos(cosine_theta)
+
+                        # Convert the angle from radians to degrees
+                        angle_degrees = math.degrees(angle_radians)
+                        if(abs(angle_degrees)<90):
+                            angle_degrees = 180-abs(angle_degrees)
+                        return "{:.2f}".format(angle_degrees)
+                    
+                    kpt_label=kpt_label + " "+ calculate_angle(keypoints[0],keypoints[1],keypoints[2])
+                else:
+                    pass
+                return  cv2.putText(image, kpt_label, (kpt_x+kpt_labelstr['offset_x'], kpt_y+kpt_labelstr['offset_y']), cv2.FONT_HERSHEY_SIMPLEX, kpt_labelstr['font_size'], kpt_color, kpt_labelstr['font_thickness'])
+
+        
+
+    def drarPoint_ex(self,cvImage,keypoints):
+        image = cvImage
+        # 框（rectangle）可视化配置
+        bbox_color = (150, 0, 0)             # 框的 BGR 颜色
+        bbox_thickness = 6                   # 框的线宽
+
+        # 框类别文字
+        bbox_labelstr = {
+            'font_size':4,         # 字体大小
+            'font_thickness':10,   # 字体粗细
+            'offset_x':0,          # X 方向，文字偏移距离，向右为正
+            'offset_y':-80,        # Y 方向，文字偏移距离，向下为正
+        }
+
+        # 关键点 BGR 配色
+        kpt_color_map = {
+            0:{'name':'a', 'color':[255, 0, 0], 'radius':20},      # 30度角点
+            1:{'name':'b', 'color':[0, 255, 0], 'radius':20},      # 60度角点
+            2:{'name':'c', 'color':[0, 0, 255], 'radius':20},      # 90度角点
+        }
+
+        # 点类别文字
+        kpt_labelstr = {
+            'font_size':2,             # 字体大小
+            'font_thickness':5,       # 字体粗细
+            'offset_x':30,             # X 方向，文字偏移距离，向右为正
+            'offset_y':120,            # Y 方向，文字偏移距离，向下为正
+        }
+
+        # 骨架连接 BGR 配色
+        skeleton_map = [
+            {'srt_kpt_id':0, 'dst_kpt_id':1, 'color':[196, 75, 255], 'thickness':3},        # 30度角点-60度角点
+            {'srt_kpt_id':1, 'dst_kpt_id':2, 'color':[196, 75, 255], 'thickness':3},        # 30度角点-90度角点
+        ]
+        keypoints = keypoints[0]
+        # 画该框的骨架连接
+        for skeleton in skeleton_map:
+            
+            # 获取起始点坐标
+            srt_kpt_id = skeleton['srt_kpt_id']
+            srt_kpt_x = int(keypoints[srt_kpt_id][0])
+            srt_kpt_y = int(keypoints[srt_kpt_id][1])
+            
+            # 获取终止点坐标
+            dst_kpt_id = skeleton['dst_kpt_id']
+            dst_kpt_x = int(keypoints[dst_kpt_id][0])
+            dst_kpt_y = int(keypoints[dst_kpt_id][1])
+            
+            # 获取骨架连接颜色
+            skeleton_color = skeleton['color']
+            
+            # 获取骨架连接线宽
+            skeleton_thickness = skeleton['thickness']
+            
+            # 画骨架连接
+            image = cv2.line(image, (srt_kpt_x, srt_kpt_y),(dst_kpt_x, dst_kpt_y),color=skeleton_color,thickness=skeleton_thickness)
+            
+            # 画该框的关键点
+        for kpt_id in kpt_color_map:
+            
+            # 获取该关键点的颜色、半径、XY坐标
+            kpt_color = kpt_color_map[kpt_id]['color']
+            kpt_radius = kpt_color_map[kpt_id]['radius']
+            kpt_x = int(keypoints[kpt_id][0])
+            kpt_y = int(keypoints[kpt_id][1])
+            
+            # 画圆：图片、XY坐标、半径、颜色、线宽（-1为填充）
+            image = cv2.circle(image, (kpt_x, kpt_y), kpt_radius, kpt_color, -1)
+            
+            # 写关键点类别文字：图片，文字字符串，文字左上角坐标，字体，字体大小，颜色，字体粗细
+            # kpt_label = str(kpt_id) # 写关键点类别 ID
+            kpt_label = str(kpt_color_map[kpt_id]['name']) # 写关键点类别名称
+            if (kpt_label=="a"or kpt_label=="c"):
+                kpt_label=" "
+            elif (kpt_label=="b"):
+                def calculate_angle(a, b, c):
+                    # Convert the points to NumPy arrays for vector operations
+                    a, b, c = np.array(a, dtype=np.float64), np.array(b, dtype=np.float64), np.array(c, dtype=np.float64)
+                    # Calculate vectors AB and BC
+                    ab_vector = b - a
+                    bc_vector = c - b
+
+                    # Calculate the dot product of AB and BC
+                    dot_product = np.dot(ab_vector, bc_vector)
+
+                    # Calculate the magnitudes of AB and BC
+                    ab_magnitude = np.linalg.norm(ab_vector)
+                    bc_magnitude = np.linalg.norm(bc_vector)
+
+                    # Calculate the cosine of the angle between AB and BC
+                    cosine_theta = dot_product / (ab_magnitude * bc_magnitude)
+
+                    # Calculate the angle in radians
+                    angle_radians = math.acos(cosine_theta)
+
+                    # Convert the angle from radians to degrees
+                    angle_degrees = math.degrees(angle_radians)
+                    if(abs(angle_degrees)<90):
+                        angle_degrees = 180-abs(angle_degrees)
+                    return "{:.2f}".format(angle_degrees)
+                
+                kpt_label=kpt_label + " "+ calculate_angle(keypoints[0],keypoints[1],keypoints[2])
+            else:
+                pass
+            image = cv2.putText(image, kpt_label, (kpt_x+kpt_labelstr['offset_x'], kpt_y+kpt_labelstr['offset_y']), cv2.FONT_HERSHEY_SIMPLEX, kpt_labelstr['font_size'], kpt_color, kpt_labelstr['font_thickness'])
+        return image
+    def drawBox(self,cvImage,bboxes_xyxy,label):
+
+    # 框（rectangle）可视化配置
+    # 框的 BGR 颜色
+        bbox_color = {
+            0:(255, 0, 0),
+            1:(0, 255, 0),
+            2:(0, 0, 255),
+            3:(173,255,47),
+            4:(32,178,170),
+            5:(128,0,128)
+
+            } 
+        # 框的线宽
+        bbox_thickness = 2                  
+
+        # 框类别文字
+        bbox_labelstr = {
+            'font_size':1,         # 字体大小
+            'font_thickness':2,   # 字体粗细
+            'offset_x':0,          # X 方向，文字偏移距离，向右为正
+            'offset_y':-20,        # Y 方向，文字偏移距离，向下为正
+        }
+        num_bbox = len(bboxes_xyxy)
+        for idx in range(num_bbox): # 遍历每个框
+            # 获取该框坐标
+            bbox_xyxy = bboxes_xyxy[idx]             
+            # 画框
+            cvImage = cv2.rectangle(cvImage, (bbox_xyxy[0], bbox_xyxy[1]), (bbox_xyxy[2], bbox_xyxy[3]), bbox_color[idx], bbox_thickness)
+            
+            # 写框类别文字：图片，文字字符串，文字左上角坐标，字体，字体大小，颜色，字体粗细
+            cvImage = cv2.putText(cvImage, label, (int((bbox_xyxy[0]))+bbox_labelstr['offset_x'], int(bbox_xyxy[1])+bbox_labelstr['offset_y']), cv2.FONT_HERSHEY_SIMPLEX, bbox_labelstr['font_size'], bbox_color[idx], bbox_labelstr['font_thickness'])
+
+        return  cvImage
+    def saveResult(self):
+        # 创建一个DataFrame对象
+        df = pd.DataFrame(self.image_list)
+        # 如果存在cvImage列，则删除它
+        if 'cvImage' in df.columns:
+            df = df.drop('cvImage', axis=1)
+        # 拆分result列并插入到当前表格
+        df_result = df['result'].apply(pd.Series)
+        df = pd.concat([df, df_result], axis=1)
+
+        # 删除原始的result列
+        df = df.drop('result', axis=1)
+        # 将DataFrame保存到Excel文件
+        df.to_excel('output.xlsx', index=False)
+
+    def drawPreImage(self,item):
+            if item["cvImage"] is not None:
+                cv2.imwrite(item["filePath"].replace(".png","_pre.png"),item["cvImage"])
+        
+    
+if __name__ == '__main__':
+    sourcePath = r"C:\Users\ruxuanyan\Desktop\images"
+    myknee = Knee(sourcePath)
+    startTime = time.time()
+    myknee.predict()
+    endTime = time.time()    
+    myknee.saveResult()
+    print(endTime-startTime)
+    print("over")
+
+    
+
+    
+    
